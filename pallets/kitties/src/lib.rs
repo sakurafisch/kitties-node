@@ -1,4 +1,5 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+pub use pallet::*;
 
 /// Edit this file to define custom logic or remove it if it is not needed.
 /// Learn more about FRAME and the core library of Substrate FRAME pallets:
@@ -65,8 +66,17 @@ pub mod pallet {
     // Errors inform users that something went wrong.
 	#[pallet::error]
 	pub enum Error<T> {
-        // TODO Part III
-	}
+        CountForKittiesOverflow,
+        ExceedMaxKittyOwned,
+        BuyerIsKittyOwner,
+        TransferToSelf,
+        KittyExists,
+        KittyNotExist,
+        NotKittyOwner,
+        KittyNotForSale,
+        KittyBidPriceTooLow,
+        NotEnoughBalance,
+    }
 
 	// Pallets use events to inform users when important changes are made.
 	// https://docs.substrate.io/v3/runtime/events-and-errors
@@ -74,6 +84,10 @@ pub mod pallet {
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
 		// TODO Part III
+        Created(T::AccountId, T::Hash),
+        PriceSet(T::AccountId, T::Hash, Option<BalanceOf<T>>),
+        Transferred(T::AccountId, T::AccountId, T::Hash),
+        Bought(T::AccountId, T::AccountId, T::Hash, BalanceOf<T>),
 	}
 
     #[pallet::storage]
@@ -110,7 +124,16 @@ pub mod pallet {
 	// Dispatchable functions must be annotated with a weight and must return a DispatchResult.
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-        // TODO Part III: create_kitty
+        #[pallet::weight(100)]
+        pub fn create_kitty(origin: OriginFor<T>) -> DispatchResult {
+            let sender = ensure_signed(origin)?;
+            let kitty_id = Self::mint(&sender, None, None)?;
+            // log::info!("A kitty is born with ID: {:?}", kitty_id);
+
+            Self::deposit_event(Event::Created(sender, kitty_id));
+
+            Ok(())
+        }
 
         // TODO Part III: set_price
 
@@ -144,8 +167,36 @@ pub mod pallet {
             payload.using_encoded(blake2_128)
         }
 
+        pub fn mint(
+            owner: &T::AccountId,
+            dna: Option<[u8; 16]>,
+            gender: Option<Gender>,
+        ) -> Result<T::Hash, Error<T>> {
+            let kitty = Kitty::<T> {
+                dna: dna.unwrap_or_else(Self::gen_dna),
+                price: None,
+                gender: gender.unwrap_or_else(Self::gen_gender),
+                owner: owner.clone(),
+            };
+
+            let kitty_id = T::Hashing::hash_of(&kitty);
+
+            let new_cnt = Self::count_for_kitties().checked_add(1)
+                .ok_or(<Error<T>>::CountForKittiesOverflow)?;
+
+            ensure!(Self::kitties(&kitty_id) == None, <Error<T>>::KittyExists);
+
+            <KittiesOwned<T>>::try_mutate(&owner, |kitty_vec| {
+                kitty_vec.try_push(kitty_id)
+            }).map_err(|_| <Error<T>>::ExceedMaxKittyOwned)?;
+
+            <Kitties<T>>::insert(kitty_id, kitty);
+            <CountForKitties<T>>::put(new_cnt);
+            Ok(kitty_id)
+        }
+
         // TODO: increment_nonce, random_hash, mint, transfer_from
     }
 }
 
-pub use pallet::*;
+
