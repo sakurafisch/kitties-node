@@ -1,5 +1,5 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-pub use pallet::*;
+
 
 /// Edit this file to define custom logic or remove it if it is not needed.
 /// Learn more about FRAME and the core library of Substrate FRAME pallets:
@@ -7,16 +7,17 @@ pub use pallet::*;
 
 #[frame_support::pallet]
 pub mod pallet {
-    use scale_info::TypeInfo;
+    use frame_system::pallet_prelude::*;
+    use frame_support::pallet_prelude::*;
     use frame_support::{
         sp_runtime::traits::Hash,
         traits::{Currency, tokens::ExistenceRequirement, Randomness},
         transactional,
-        pallet_prelude::*
     };
-    use frame_system::pallet_prelude::*;
 
     use sp_io::hashing::blake2_128;
+    use scale_info::TypeInfo;
+
 
     #[cfg(feature = "std")]
     use frame_support::serde::{Deserialize, Serialize};
@@ -119,33 +120,141 @@ pub mod pallet {
 
     // TODO Part III: Our pallet's genesis configuration.
 
-	// Dispatchable functions allows users to interact with the pallet and invoke state changes.
-	// These functions materialize as "extrinsics", which are often compared to transactions.
-	// Dispatchable functions must be annotated with a weight and must return a DispatchResult.
-	#[pallet::call]
-	impl<T: Config> Pallet<T> {
+    // TODO Part II: helper function for Kitty struct
+
+    #[pallet::genesis_config]
+    pub struct GenesisConfig<T: Config> {
+        pub kitties: Vec<(T::AccountId, [u8; 16], Gender)>
+    }
+
+    #[cfg(feature = "std")]
+    impl<T: Config> Default for GenesisConfig<T> {
+        fn default() -> GenesisConfig<T> {
+            GenesisConfig {
+                kitties: vec![]
+            }
+        }
+    }
+
+    #[pallet::genesis_build]
+    impl<T: Config> GenesisBuild<T> for GenesisConfig<T> {
+        fn build(&self) {
+            for (acct, dna, gender) in &self.kitties {
+                let _ = <Pallet<T>>::mint(acct, Some(dna.clone()), Some(gender.clone()));
+            }
+        }
+    }
+
+    #[pallet::hooks]
+    impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+
+    }
+
+    #[pallet::call]
+    impl<T: Config> Pallet<T> {
         #[pallet::weight(100)]
         pub fn create_kitty(origin: OriginFor<T>) -> DispatchResult {
             let sender = ensure_signed(origin)?;
             let kitty_id = Self::mint(&sender, None, None)?;
-            // log::info!("A kitty is born with ID: {:?}", kitty_id);
 
+            log::info!("A kitty is born with ID: {:?}", kitty_id);
             Self::deposit_event(Event::Created(sender, kitty_id));
+            Ok(())
+        }
+
+        #[pallet::weight(100)]
+        pub fn set_price(
+            origin: OriginFor<T>,
+            kitty_id: T::Hash,
+            new_price: Option<BalanceOf<T>>
+        ) -> DispatchResult {
+            let sender = ensure_signed(origin)?;
+
+            ensure!(Self::is_kitty_owner(&kitty_id, &sender)?, <Error<T>>::NotKittyOwner);
+
+            let mut kitty = Self::kitties(&kitty_id).ok_or(<Error<T>>::KittyNotExist)?;
+
+            kitty.price = new_price.clone();
+            <Kitties<T>>::insert(&kitty_id, kitty);
+
+            Self::deposit_event(Event::PriceSet(sender, kitty_id, new_price));
 
             Ok(())
         }
 
-        // TODO Part III: set_price
+        #[pallet::weight(100)]
+        pub fn transfer(
+            origin: OriginFor<T>,
+            to: T::AccountId,
+            kitty_id: T::Hash
+        ) -> DispatchResult {
+            let from = ensure_signed(origin)?;
+            
+            ensure!(Self::is_kitty_owner(&kitty_id, &from)?, <Error<T>>::NotKittyOwner);
+            ensure!(from != to, <Error<T>>::TransferToSelf);
 
-        // TODO Part III: transfer
+            let to_owned = <KittiesOwned<T>>::get(&to);
+            ensure!((to_owned.len() as u32) < T::MaxKittyOwned::get(), <Error<T>>::ExceedMaxKittyOwned);
 
-        // TODO Part III: buy_kitty
+            Self::transfer_kitty_to(&kitty_id, &to)?;
 
-        // TODO Part III: breed_kitty
+            Self::deposit_event(Event::Transferred(from, to, kitty_id));
 
-	}
+            Ok(())
+        }
 
-    // TODO Part II: helper function for Kitty struct
+        #[transactional]
+        #[pallet::weight(100)]
+        pub fn buy_kitty(
+            origin: OriginFor<T>,
+            kitty_id: T::Hash,
+            bid_price: BalanceOf<T>
+        ) -> DispatchResult {
+            let buyer = ensure_signed(origin)?;
+
+            let kitty = Self::kitties(&kitty_id).ok_or(<Error<T>>::KittyNotExist)?;
+            ensure!(kitty.owner != buyer, <Error<T>>::BuyerIsKittyOwner);
+
+            if let Some(ask_price) = kitty.price {
+                ensure!(ask_price <= bid_price, <Error<T>>::KittyBidPriceTooLow);
+            } else {
+                Err(<Error<T>>::KittyNotForSale)?;
+            }
+
+            ensure!(T::Currency::free_balance(&buyer) >= bid_price, <Error<T>>::NotEnoughBalance);
+
+            let to_owned = <KittiesOwned<T>>::get(&buyer);
+
+            ensure!((to_owned.len() as u32) < T::MaxKittyOwned::get(), <Error<T>>::ExceedMaxKittyOwned);
+
+            let seller = kitty.owner.clone();
+
+            T::Currency::transfer(&buyer, &seller, bid_price, ExistenceRequirement::KeepAlive)?;
+
+            Self::transfer_kitty_to(&kitty_id, &buyer)?;
+
+            Self::deposit_event(Event::Bought(buyer, seller, kitty_id, bid_price));
+
+            Ok(())
+        }
+
+        #[pallet::weight(100)]
+        pub fn breed_kitty(
+            origin: OriginFor<T>,
+            parent1: T::Hash,
+            parent2: T::Hash
+        ) -> DispatchResult {
+            let sender = ensure_signed(origin)?;
+
+            ensure!(Self::is_kitty_owner(&parent1, &sender)?, <Error<T>>::NotKittyOwner);
+            ensure!(Self::is_kitty_owner(&parent2, &sender)?, <Error<T>>::NotKittyOwner);
+
+            let new_dna = Self::breed_dna(&parent1, &parent2)?;
+            Self::mint(&sender, Some(new_dna), None)?;
+
+            Ok(())
+        }
+    }
 
     impl<T: Config> Pallet<T> {
         fn gen_gender() -> Gender {
@@ -165,6 +274,17 @@ pub mod pallet {
                 <frame_system::Pallet<T>>::block_number(),
             );
             payload.using_encoded(blake2_128)
+        }
+
+        pub fn breed_dna(parent1: &T::Hash, parent2: &T::Hash) -> Result<[u8; 16], Error<T>> {
+            let dna1 = Self::kitties(parent1).ok_or(<Error<T>>::KittyNotExist)?.dna;
+            let dna2 = Self::kitties(parent2).ok_or(<Error<T>>::KittyNotExist)?.dna;
+
+            let mut new_dna = Self::gen_dna();
+            for i in 0..new_dna.len() {
+                new_dna[i] = (new_dna[i] & dna1[i] | (!new_dna[i] & dna2[i]));
+            }
+            Ok(new_dna)
         }
 
         pub fn mint(
@@ -195,8 +315,39 @@ pub mod pallet {
             Ok(kitty_id)
         }
 
-        // TODO: increment_nonce, random_hash, mint, transfer_from
+        pub fn is_kitty_owner(kitty_id: &T::Hash, acct: &T::AccountId) -> Result<bool, Error<T>> {
+            match Self::kitties(kitty_id) {
+                Some(kitty) => Ok(kitty.owner == *acct),
+                None => Err(<Error<T>>::KittyNotExist)
+            }
+        }
+
+        #[transactional]
+        pub fn transfer_kitty_to(
+            kitty_id: &T::Hash,
+            to: &T::AccountId,
+        ) -> Result<(), Error<T>> {
+            let mut kitty = Self::kitties(&kitty_id).ok_or(<Error<T>>::KittyNotExist)?;
+            let prev_owner = kitty.owner.clone();
+            <KittiesOwned<T>>::try_mutate(&prev_owner, |owned| {
+                if let Some(ind) = owned.iter().position(|&id| id == *kitty_id) {
+                    owned.swap_remove(ind);
+                    return Ok(());
+                }
+                Err(())
+            }).map_err(|_| <Error<T>>::KittyNotExist)?;
+            kitty.owner = to.clone();
+            kitty.price = None;
+
+            <Kitties<T>>::insert(kitty_id, kitty);
+
+            <KittiesOwned<T>>::try_mutate(to, |vec| {
+                vec.try_push(*kitty_id)
+            }).map_err(|_| <Error<T>>::ExceedMaxKittyOwned)?;
+
+            Ok(())
+        }
     }
 }
 
-
+pub use pallet::*;
